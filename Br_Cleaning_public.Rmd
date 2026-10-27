@@ -1,0 +1,417 @@
+---
+title: "Recover E Breast Data Management"
+output: html_document
+author: Erin Nolan
+date: "2025-10-30"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+#to make the renv intially
+#renv::init()
+
+#renv friendly loading of packages.
+#dont use pacman for this as it may overwrite the version of the package used in renv
+required_packages <- c("tidyverse", "here", "renv","Hmisc","mice")
+
+missing <- required_packages[!sapply(required_packages, requireNamespace, quietly = TRUE)]
+if (length(missing) > 0) {
+  stop("Missing packages: ", paste(missing, collapse = ", "), 
+       ". Please run renv::restore() to install them.")
+}
+#if a package isnt installed in renv::restore(), do this: 
+#renv::install("tidyverse")
+
+library(renv)
+library(tidyverse)
+library(here)
+library(Hmisc)
+library(mice)
+
+#record-level corrections and per-protocol ids, kept with the restricted data
+source(here("Programs","record_corrections.R"))
+
+```
+
+# Analysis phase 1
+
+## Read in the initial data
+```{r}
+breast_init <- readRDS(here("Data","breast_init.RDS"))
+breast_active_init <- readRDS(here("Data","breast_active_init.RDS")) %>% dplyr::select(-redcap_event_name,-redcap_event_name.factor)
+```
+
+## Data cleaning
+```{r}
+breast <- breast_init %>%
+  group_by(record_id) %>%
+  #data across 2 rows but dont share columns, can keep 1 row only
+  tidyr::fill(everything(),.direction="downup") %>%
+  filter(redcap_event_name.factor == "Baseline") %>%
+  merge(breast_active_init,by="record_id") %>%
+  #drop columns that are empty and not needed columns
+  dplyr::select(where(~sum(!is.na(.x)) > 0),
+                -qor1.factor,-qor2.factor,-qor3.factor,-qor4.factor,-qor5.factor,
+                -qor6.factor,-qor7.factor,-qor8.factor,-qor9.factor,-qor10.factor,
+                -qor11.factor,-qor12.factor,-qor13.factor,-qor14.factor,-qor15.factor,
+                -sex,-country_born,-aboriginal_tso_origin,-other_language_home.factor,
+                -education,-live_with___1.factor,-live_with___0.factor,
+                -live_with___2.factor,-live_with___3.factor,-live_with___98.factor,
+                -live_with___99.factor,-overnight_stay.factor,-assess_pca.factor,
+                -employment_yn.factor,-hlth_ins_0.factor,-previous_surgery.factor,
+                -internet_time,-ppt_postcode,-recruited_from,-actual_surgery_date,
+                -discharged_date,-surgery_type,-live_with___98,-aria_code,
+                -assess_understand_enhance) %>%
+  rename(spouse_partner = live_with___1,
+         children = live_with___2,
+         other_family = live_with___3,
+         on_own = live_with___0) %>%
+  mutate(across(where(is.factor), fct_drop)) %>%
+  mutate(across(where(is.factor), ~{x <- .
+                                  x[x == "Missing"] <- NA
+                                  droplevels(x)})) %>%
+  mutate(country_born.factor = case_when(country_born.factor == "Other {country_born_other}" ~ "Other",
+                                      .default=country_born.factor),
+         treatment = factor(treatment_group),
+         meals_bin = case_when(assess_meals_eaten %in% c(1,2) ~ 0,
+                               assess_meals_eaten %in% c(3) ~ 1),
+         snacks_bin = case_when(snacks_hosp %in% c(0,1,2) ~ 0,
+                                snacks_hosp %in% c(3) ~ 1),
+         liquid_bin = case_when(assess_liquid >= 4 ~ 1,
+                                assess_liquid < 4 ~ 0),
+         qor_tot = qor1+qor2+qor3+qor4+qor5+qor6+qor7+qor8+qor9+qor10+qor11+qor12+
+                   qor13+qor14+qor15) %>%
+  correct_records() %>%
+  mutate(per_protocol = as.integer(record_id %in% pp_ids))
+label(breast$qor_tot) <- "qor_tot"
+
+saveRDS(breast,here("Data","breast.RDS"))
+
+```
+
+## Imputation
+```{r}
+breast_miss <- breast %>%
+  ungroup() %>%
+  dplyr::select(record_id,treatment,assess_walk_num,los,assess_pca,assess_meals_eaten,
+                snacks_hosp,assess_liquid,assess_exercises,
+                assess_understand_enhance.factor,
+                qor1,qor2,qor3,qor4,qor5,qor6,qor7,qor8,qor9,qor10,qor11,qor12,
+                qor13,qor14,qor15,
+                master_age,aria_code.factor,surgery_type.factor,
+                employment_yn,previous_surgery,spouse_partner,children,on_own,
+                minutes_out_of_bed,minutes_walking_moving)
+imp <- mice::mice(breast_miss, m = 15, print = FALSE,method="pmm",maxit=50,seed=487103578,
+            pred=quickpred(breast_miss,include=c("treatment","surgery_type.factor"),
+                           exclude=c("record_id","assess_pca"),
+                           minpuc = 0.2,mincor=0.4,method="spearman"))
+densityplot(imp)
+plot(imp)
+
+test <- imp[["loggedEvents"]]
+breast_imp <- complete(imp,action="long") %>%
+  mutate(qor_tot = qor1+qor2+qor3+qor4+qor5+qor6+qor7+qor8+qor9+qor10+qor11+qor12+
+                   qor13+qor14+qor15,
+         meals_bin = case_when(assess_meals_eaten %in% c(1,2) ~ 0,
+                               assess_meals_eaten %in% c(3) ~ 1),
+         snacks_bin = case_when(snacks_hosp %in% c(0,1,2) ~ 0,
+                                snacks_hosp %in% c(3) ~ 1),
+         liquid_bin = case_when(assess_liquid >= 4 ~ 1,
+                                assess_liquid < 4 ~ 0),
+         how_bin = case_when(assess_understand_enhance.factor %in% c("A","SA") ~ 1,
+                             assess_understand_enhance.factor %in% c("N","D","SD") ~ 0)) %>%
+  left_join(breast %>% ungroup() %>% dplyr::select(record_id,per_protocol),by="record_id")
+
+saveRDS(breast_imp,here("Data","breast_imp.RDS"))
+```
+
+los = los
+pca device = assess_pca
+meals = assess_meals_eaten
+snacks = snacks_hosp
+fluids = assess_liquid
+time out of bed = minutes_out_of_bed
+time spent moving = minutes_walking_moving
+times walked = assess_walk_num
+times physio = assess_exercises
+how to enhance own recovery = assess_understand_enhance.factor
+QOR = sum of qors
+
+# Analysis phase 2
+
+## Read in the data
+
+```{r}
+br_p2_init <- readRDS(here("Data","br_p2_init.RDS"))
+```
+
+## Data cleaning
+
+```{r}
+br_p2 <- br_p2_init %>%
+  dplyr::select(-redcap_event_name,
+                -hads_tense.factor,-hads_enjoy.factor,-hads_awful.factor,-hads_laugh.factor,
+                -hads_worry.factor,-hads_cheerful.factor,-hads_relaxed.factor,-hads_slowed.factor,
+                -hads_butterflies.factor,-hads_appearance.factor,-hads_restless.factor,
+                -hads_forward.factor,-hads_panic.factor,-hads_book.factor,
+                -qor1.factor,-qor2.factor,-qor3.factor,-qor4.factor,-qor5.factor,
+                -qor6.factor,-qor7.factor,-qor8.factor,-qor9.factor,-qor10.factor,
+                -qor11.factor,-qor12.factor,-qor13.factor,-qor14.factor,-qor15.factor,
+                -ae_fall_yn,-ae_pain_yn,-ae_anxiety_yn,
+                -q1.factor,-q2.factor,-q3.factor,-q4.factor,-q5.factor,-q6.factor,
+                -q7.factor,-q8.factor,-q9.factor,-q10.factor,-q11.factor,-q12.factor,
+                -q13.factor,-q14.factor,-q15.factor,-q16.factor,-q17.factor,-q18.factor,
+                -q19.factor,-q20.factor,-q21.factor,-q22.factor,-q23.factor,-q24.factor,
+                -q25.factor,-q26.factor,-q27.factor,-q28.factor,-q29.factor,-q30.factor) %>%
+    #blank means 0 for these 3
+  mutate(`ed_presentations_3mo` = ifelse(is.na(`ed_presentations_3mo`),0,`ed_presentations_3mo`),
+         `admissions_3mo` = ifelse(is.na(`admissions_3mo`),0,`admissions_3mo`),
+         `nights_admitted_3mo` = ifelse(is.na(`nights_admitted_3mo`),0,`nights_admitted_3mo`),
+         ed_presentations_3mo = ifelse(redcap_event_name.factor == "3 month fup",ed_presentations_3mo,NA),
+         admissions_3mo = ifelse(redcap_event_name.factor == "3 month fup",admissions_3mo,NA),
+         nights_admitted_3mo = ifelse(redcap_event_name.factor == "3 month fup",nights_admitted_3mo,NA))
+
+
+#the dataset for imputation
+br_p2_imp1 <- br_p2 %>% 
+  dplyr::select(redcap_event_name.factor,
+                record_id,
+                q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19,
+                q20,q21,q22,q23,q24,q25,q26,q27,q28,q29,q30,
+                qor1,qor2,qor3,qor4,qor5,qor6,qor7,qor8,qor9,qor10,qor11,qor12,qor13,qor14,qor15,
+                hads_tense,hads_awful,hads_worry,hads_relaxed,hads_butterflies,
+                hads_restless,hads_panic,
+                hads_enjoy,hads_laugh,hads_cheerful,hads_slowed,hads_appearance,
+                hads_forward,hads_book,
+                services_total_cost,ed_presentations_3mo,admissions_3mo,nights_admitted_3mo) %>%
+  pivot_wider(id_cols=record_id,names_from = redcap_event_name.factor,
+              values_from = c(q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19,
+                q20,q21,q22,q23,q24,q25,q26,q27,q28,q29,q30,
+                qor1,qor2,qor3,qor4,qor5,qor6,qor7,qor8,qor9,qor10,qor11,qor12,qor13,qor14,qor15,
+                hads_tense,hads_awful,hads_worry,hads_relaxed,hads_butterflies,
+                hads_restless,hads_panic,
+                hads_enjoy,hads_laugh,hads_cheerful,hads_slowed,hads_appearance,
+                hads_forward,hads_book,
+                services_total_cost,ed_presentations_3mo,admissions_3mo,nights_admitted_3mo)) %>%
+  dplyr::select(where(~sum(!is.na(.x)) > 0)) %>%
+  #blank means 0 for these 3
+  mutate(`ed_presentations_3mo_3 month fup` = ifelse(is.na(`ed_presentations_3mo_3 month fup`),0,`ed_presentations_3mo_3 month fup`),
+         `admissions_3mo_3 month fup` = ifelse(is.na(`admissions_3mo_3 month fup`),0,`admissions_3mo_3 month fup`),
+         `nights_admitted_3mo_3 month fup` = ifelse(is.na(`nights_admitted_3mo_3 month fup`),0,`nights_admitted_3mo_3 month fup`))
+
+#add in some covariates thatll be used for imputation
+breast_p1 <- readRDS(here("Data","breast.RDS")) %>%
+  dplyr::select(record_id,master_age,treatment,surgery_type.factor) %>%
+           mutate(surgery_final = case_when(surgery_type.factor %in% c("Mastectomy and delayed reconstruction","Mastectomy - no reconstruction") ~ 1,
+                                   surgery_type.factor == "Mastectomy and immediate reconstruction" ~ 0))
+br_p2_imp2 <- merge(breast_p1,br_p2_imp1,by="record_id")
+```
+
+## calculating scores for the non imputed dataset
+```{r}
+br_p2_1 <- br_p2 %>%
+  mutate(hads_anxiety = hads_tense + hads_awful + hads_worry + hads_relaxed + hads_butterflies + hads_restless + hads_panic,
+         hads_depress = hads_enjoy + hads_laugh + hads_cheerful + hads_slowed + hads_appearance + hads_forward + hads_book,
+         qor_tot = qor1+qor2+qor3+qor4+qor5+qor6+qor7+qor8+qor9+qor10+qor11+qor12+qor13+qor14+qor15,
+         ae_fall_yn = case_when(ae_fall_yn.factor == "Yes" ~ 1,
+                                ae_fall_yn.factor == "No" ~ 0),
+         ae_anxiety_yn = case_when(ae_anxiety_yn.factor == "Yes" ~ 1,
+                                   ae_anxiety_yn.factor == "No" ~ 0),
+         ae_pain_yn = case_when(ae_pain_yn.factor == "Yes" ~ 1,
+                                ae_pain_yn.factor == "No" ~ 0))
+
+br_p2_2 <- br_p2_1 %>% 
+  rowwise() %>% 
+  mutate(QL2_raw = sum(across(q29:q30))/2) %>% 
+  mutate(QL2 = (QL2_raw - 1)/6*100) %>% 
+  #Functional scales
+  #mutate(PF2_miss = sum(is.na(across(a1:a5)))) %>% 
+  mutate(PF2_raw = sum(across(q1:q5))/sum(!is.na(across(q1:q5)))) %>% 
+  mutate(PF2 = (1-(PF2_raw-1)/3)*100) %>% 
+  mutate(RF2_raw = sum(across(q6:q7))/2) %>% 
+  mutate(RF2 = (1-(RF2_raw-1)/3)*100) %>% 
+  #mutate(EF_miss = sum(is.na(across(a21:a24)))) %>%
+  mutate(EF_raw = sum(across(q21:q24))/sum(!is.na(across(q21:q24)))) %>% 
+  mutate(EF = (1-(EF_raw-1)/3)*100) %>% 
+  mutate(CF_raw = sum(across(c(q20, q25)))/2) %>% 
+  mutate(CF = (1-(CF_raw-1)/3)*100) %>% 
+  mutate(SF_raw = sum(across(c(q26, q27)))/2) %>% 
+  mutate(SF = (1-(SF_raw-1)/3)*100) %>% 
+  #Symptom scales
+  #mutate(FA_miss = sum(is.na(across(c(a10, a12, a18))))) %>% 
+  mutate(FA_raw = sum(across(c(q10, q12, q18)))/sum(!is.na(across(c(q10, q12, q18))))) %>% 
+  mutate(FA = (FA_raw - 1)/3*100) %>% 
+  mutate(FA_rev =(1-(FA_raw - 1)/3)*100) %>% 
+  mutate(NV_raw = sum(across(c(q14,q15))/2)) %>% 
+  mutate(NV = (NV_raw - 1)/3*100) %>% 
+  mutate(NV_rev =(1-(NV_raw - 1)/3)*100) %>% 
+  mutate(PA_raw = sum(across(c(q9,q19))/2)) %>% 
+  mutate(PA = (PA_raw - 1)/3*100) %>% 
+  mutate(PA_rev = (1 - (PA_raw - 1)/3)*100) %>%
+  mutate(DY = (q8-1)/3*100) %>% 
+  mutate(DY_rev = (1 - (q8-1)/3)*100) %>% 
+  mutate(SL = (q11-1)/3*100) %>%
+  mutate(SL_rev = (1 - (q11-1)/3)*100) %>%
+  mutate(AP = (q13-1)/3*100) %>%
+  mutate(AP_rev = (1 - (q13-1)/3)*100) %>%
+  mutate(CO = (q16-1)/3*100) %>%
+  mutate(CO_rev = (1-(q16-1)/3)*100) %>%
+  mutate(DI = (q17-1)/3*100) %>%
+  mutate(DI_rev = (1 - (q17-1)/3)*100) %>%
+  mutate(FI = (q28-1)/3*100) %>% 
+  mutate(summary_score = sum(across(c(PF2, RF2, EF, CF, SF,
+                                    FA_rev, NV_rev, PA_rev, DY_rev, SL_rev, AP_rev, CO_rev, DI_rev)))/13) %>%  dplyr::select(-q1,-q2,-q3,-q4,-q5,-q6,-q7,-q8,-q9,-q10,-q11,-q12,-q13,-q14,-q15,
+                -q16,-q17,-q18,-q19,-q20,-q21,-q22,-q23,-q24,-q25,-q26,-q27,-q28,
+                -q29,-q30,
+                -QL2_raw,-PF2_raw,-RF2_raw,-EF_raw,-CF_raw,
+                -SF_raw,-FA_raw,-NV_raw,-PA_raw,-FA_rev,-NV_rev,-PA_rev,
+                -DY_rev,-SL_rev,-AP_rev,-CO_rev,-DI_rev,
+                -hads_tense,-hads_awful,-hads_worry,-hads_relaxed,-hads_butterflies,-hads_restless,-hads_panic,
+                -hads_enjoy,-hads_laugh,-hads_cheerful,-hads_slowed,-hads_appearance,-hads_forward,-hads_book,
+                -qor1,-qor2,-qor3,-qor4,-qor5,-qor6,-qor7,-qor8,-qor9,-qor10,
+                -qor11,-qor12,-qor13,-qor14,-qor15)
+
+breast_p1 <- readRDS(here("Data","breast.RDS")) %>%
+  dplyr::select(record_id,master_age,treatment,surgery_type.factor) %>%
+           mutate(surgery_final = case_when(surgery_type.factor %in% c("Mastectomy and delayed reconstruction","Mastectomy - no reconstruction") ~ 1,
+                                   surgery_type.factor == "Mastectomy and immediate reconstruction" ~ 0))
+br_p2_3 <- merge(breast_p1,br_p2_2,by="record_id")
+
+saveRDS(br_p2_3,here("Data","br_p2.RDS"))
+```
+
+
+
+## Imputation second dataset
+
+```{r}
+#getting the predictor matrix
+imp <- mice::mice(br_p2_imp2, m = 1, print = FALSE,method="pmm",maxit=50,seed=487103578,
+            pred=quickpred(br_p2_imp2,include=c("treatment","surgery_type.factor"),
+                           minpuc = 0.2,mincor=0.6,method="spearman"))
+
+test <- imp[["loggedEvents"]]
+predmat <- imp[["predictorMatrix"]]
+
+#mice cannot impute variables with a single observed value,
+#so set the missing values to the observed value for those variables
+item_vars <- grep("^(q[0-9]|qor|hads_)", names(br_p2_imp2), value = TRUE)
+const_vars <- item_vars[sapply(br_p2_imp2[item_vars], \(x) anyNA(x) && n_distinct(na.omit(x)) == 1)]
+br_p2_imp2[const_vars] <- lapply(br_p2_imp2[const_vars], \(x) replace(x, is.na(x), unique(na.omit(x))))
+#small sample so have to reduce number of variables used to predict
+#set no predictors except treatment and surgery type
+predmat[] <- 0
+predmat[,"treatment"] <- 1
+predmat[,"surgery_type.factor"] <- 1
+predmat["treatment","treatment"] <- 0
+predmat["surgery_type.factor","surgery_type.factor"] <- 0
+
+#add in the other times of that variable to predict matrix
+for (i in 1:30) {
+  predmat[paste0("q", i, "_Baseline"), paste0("q", i, "_1 month fup")] <- 1
+  predmat[paste0("q", i, "_Baseline"), paste0("q", i, "_3 month fup")] <- 1
+  predmat[paste0("q", i, "_1 month fup"), paste0("q", i, "_Baseline")] <- 1
+  predmat[paste0("q", i, "_1 month fup"), paste0("q", i, "_3 month fup")] <- 1
+  predmat[paste0("q", i, "_3 month fup"), paste0("q", i, "_Baseline")] <- 1
+  predmat[paste0("q", i, "_3 month fup"), paste0("q", i, "_1 month fup")] <- 1
+}
+#add in the other times of that variable to predict matrix
+for (i in 1:15) {
+  predmat[paste0("qor", i, "_Admission"), paste0("qor", i, "_1 month fup")] <- 1
+  predmat[paste0("qor", i, "_Admission"), paste0("qor", i, "_3 month fup")] <- 1
+  predmat[paste0("qor", i, "_1 month fup"), paste0("qor", i, "_Admission")] <- 1
+  predmat[paste0("qor", i, "_1 month fup"), paste0("qor", i, "_3 month fup")] <- 1
+  predmat[paste0("qor", i, "_3 month fup"), paste0("qor", i, "_Admission")] <- 1
+  predmat[paste0("qor", i, "_3 month fup"), paste0("qor", i, "_1 month fup")] <- 1
+}
+
+for (i in c("tense","awful","worry","relaxed","butterflies","restless","panic",
+            "enjoy","laugh","cheerful","slowed","appearance","forward","book")){
+  predmat[paste0("hads_", i, "_Baseline"), paste0("hads_", i, "_1 month fup")] <- 1
+  predmat[paste0("hads_", i, "_Baseline"), paste0("hads_", i, "_3 month fup")] <- 1
+  predmat[paste0("hads_", i, "_1 month fup"), paste0("hads_", i, "_Baseline")] <- 1
+  predmat[paste0("hads_", i, "_1 month fup"), paste0("hads_", i, "_3 month fup")] <- 1
+  predmat[paste0("hads_", i, "_3 month fup"), paste0("hads_", i, "_Baseline")] <- 1
+  predmat[paste0("hads_", i, "_3 month fup"), paste0("hads_", i, "_1 month fup")] <- 1
+}
+#the actual imputation
+imp <- mice::mice(br_p2_imp2, m = 15, print = FALSE,method="pmm",maxit=50,seed=487103578,
+            predictorMatrix=predmat)
+test <- imp[["loggedEvents"]]
+#hads_restless is not using the other time points but all other vars are fine. 
+br_p2_imp <- complete(imp,action="long")
+#pivot the data back to long form
+br_p2_imp_1 <- br_p2_imp %>% 
+  pivot_longer(cols = -c(record_id,treatment,master_age,surgery_type.factor,.imp,.id),
+               names_to = c(".value", "redcap_event_name.factor"),
+               names_pattern = "(.+)_(Baseline|Admission|1 month fup|3 month fup)$")
+```
+
+## calculate scores post imputation
+
+```{r}
+br_p2_imp_2 <- br_p2_imp_1 %>%
+  mutate(hads_anxiety = hads_tense + hads_awful + hads_worry + hads_relaxed + hads_butterflies + hads_restless + hads_panic,
+         hads_depress = hads_enjoy + hads_laugh + hads_cheerful + hads_slowed + hads_appearance + hads_forward + hads_book,
+         qor_tot = qor1+qor2+qor3+qor4+qor5+qor6+qor7+qor8+qor9+qor10+qor11+qor12+qor13+qor14+qor15)
+
+br_p2_imp_3 <- br_p2_imp_2 %>% 
+  rowwise() %>% 
+  #Global Health status/QoL
+  mutate(QL2_raw = sum(across(q29:q30))/2) %>% 
+  mutate(QL2 = (QL2_raw - 1)/6*100) %>% 
+  #Functional scales
+  mutate(PF2_miss = sum(is.na(across(q1:q5)))) %>% 
+  mutate(PF2_raw = if_else(PF2_miss < 2.5, sum(across(q1:q5), na.rm=T)/sum(!is.na(across(q1:q5))), NA)) %>% 
+  mutate(PF2 = (1-(PF2_raw-1)/3)*100) %>% 
+  mutate(RF2_raw = sum(across(q6:q7))/2) %>% 
+  mutate(RF2 = (1-(RF2_raw-1)/3)*100) %>% 
+  mutate(EF_miss = sum(is.na(across(q21:q24)))) %>%
+  mutate(EF_raw = if_else(EF_miss < 2.5, sum(across(q21:q24), na.rm=T)/sum(!is.na(across(q21:q24))), NA)) %>% 
+  mutate(EF = (1-(EF_raw-1)/3)*100) %>% 
+  mutate(CF_raw = sum(across(c(q20, q25)))/2) %>% 
+  mutate(CF = (1-(CF_raw-1)/3)*100) %>% 
+  mutate(SF_raw = sum(across(c(q26, q27)))/2) %>% 
+  mutate(SF = (1-(SF_raw-1)/3)*100) %>% 
+  #Symptom scales
+  mutate(FA_miss = sum(is.na(across(c(q10, q12, q18))))) %>% 
+  mutate(FA_raw = if_else(FA_miss < 1.5, sum(across(c(q10, q12, q18)), na.rm=T)/sum(!is.na(across(c(q10, q12, q18)))), NA)) %>% 
+  mutate(FA = (FA_raw - 1)/3*100) %>% 
+  mutate(FA_rev =(1-(FA_raw - 1)/3)*100) %>% 
+  mutate(NV_raw = sum(across(c(q14,q15))/2)) %>% 
+  mutate(NV = (NV_raw - 1)/3*100) %>% 
+  mutate(NV_rev =(1-(NV_raw - 1)/3)*100) %>% 
+  mutate(PA_raw = sum(across(c(q9,q19))/2)) %>% 
+  mutate(PA = (PA_raw - 1)/3*100) %>% 
+  mutate(PA_rev = (1 - (PA_raw - 1)/3)*100) %>%
+  mutate(DY = (q8-1)/3*100) %>% 
+  mutate(DY_rev = (1 - (q8-1)/3)*100) %>% 
+  mutate(SL = (q11-1)/3*100) %>%
+  mutate(SL_rev = (1 - (q11-1)/3)*100) %>%
+  mutate(AP = (q13-1)/3*100) %>%
+  mutate(AP_rev = (1 - (q13-1)/3)*100) %>%
+  mutate(CO = (q16-1)/3*100) %>%
+  mutate(CO_rev = (1-(q16-1)/3)*100) %>%
+  mutate(DI = (q17-1)/3*100) %>%
+  mutate(DI_rev = (1 - (q17-1)/3)*100) %>%
+  mutate(FI = (q28-1)/3*100) %>% 
+  mutate(summary_score = sum(across(c(PF2, RF2, EF, CF, SF,
+                                    FA_rev, NV_rev, PA_rev, DY_rev, SL_rev, AP_rev, CO_rev, DI_rev)))/13) %>%
+  dplyr::select(-q1,-q2,-q3,-q4,-q5,-q6,-q7,-q8,-q9,-q10,-q11,-q12,-q13,-q14,-q15,
+                -q16,-q17,-q18,-q19,-q20,-q21,-q22,-q23,-q24,-q25,-q26,-q27,-q28,
+                -q29,-q30,-.id,
+                -PF2_miss,-QL2_raw,-PF2_raw,-RF2_raw,-EF_miss,-EF_raw,-CF_raw,
+                -SF_raw,-FA_miss,-FA_raw,-NV_raw,-PA_raw,-FA_rev,-NV_rev,-PA_rev,
+                -DY_rev,-SL_rev,-AP_rev,-CO_rev,-DI_rev,
+                -hads_tense,-hads_awful,-hads_worry,-hads_relaxed,-hads_butterflies,-hads_restless,-hads_panic,
+                -hads_enjoy,-hads_laugh,-hads_cheerful,-hads_slowed,-hads_appearance,-hads_forward,-hads_book,
+                -qor1,-qor2,-qor3,-qor4,-qor5,-qor6,-qor7,-qor8,-qor9,-qor10,
+                -qor11,-qor12,-qor13,-qor14,-qor15)
+```
+
+```{r}
+saveRDS(br_p2_imp_3,here("Data","br_p2_imp.RDS"))
+```
+

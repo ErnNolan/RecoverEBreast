@@ -1,0 +1,876 @@
+---
+title: "Recover E Breast Analysis"
+output: html_document
+author: Erin Nolan
+date: "2025-10-30"
+---
+
+#Setup
+```{r setup, include=FALSE}
+
+#to make the renv intially
+#renv::init()
+
+#renv friendly loading of packages.
+#dont use pacman for this as it may overwrite the version of the package used in renv
+required_packages <- c("knitr","tidyverse", "here", "renv","Hmisc","brms","mice","gtsummary","posterior","marginaleffects","bayestestR")
+
+missing <- required_packages[!sapply(required_packages, requireNamespace, quietly = TRUE)]
+if (length(missing) > 0) {
+  stop("Missing packages: ", paste(missing, collapse = ", "), 
+       ". Please run renv::restore() to install them.")
+}
+#if a package isnt installed in renv::restore(), do this: 
+#renv::install("tidyverse")
+
+library(renv)
+library(tidyverse)
+library(here)
+library(Hmisc)
+library(brms)
+library(mice)
+library(gtsummary)
+library(posterior)
+library(marginaleffects)
+library(bayestestR)
+
+knitr::opts_chunk$set(echo = FALSE)
+
+#functions
+#convergence function - to see the model convergence diagnostics for each imputation
+convergence <- function(chains=4,imps=20,mod=mod){
+  draws <- as_draws_array(mod)
+  # Subset chains for each dataset
+  draws_per_dat <- lapply(1:imps, \(i) {
+    start_chain <- (i - 1) * chains + 1
+    end_chain <- i * chains
+    subset_draws(draws, chain = start_chain:end_chain)
+  })
+  summaries <- lapply(draws_per_dat, summarise_draws, default_convergence_measures())
+  return(summaries)
+}
+
+```
+
+# Analysis phase 1
+
+##Read in the data
+```{r}
+breast <- readRDS(here("Data","breast.RDS"))
+breast_imp <- readRDS(here("Data","breast_imp.RDS"))
+breast_split <- split(x=breast_imp,f=breast_imp$.imp)
+
+```
+
+los = los
+pca device = assess_pca
+meals = assess_meals_eaten
+snacks = snacks_hosp
+fluids = assess_liquid
+time out of bed = minutes_out_of_bed
+time spent moving = minutes_walking_moving
+times walked = assess_walk_num
+times physio = assess_exercises
+how to enhance own recovery = assess_understand_enhance.factor
+QOR = sum of qors
+
+Have enough iterations + strong enough prior to get ~10000 draws in ess bulk and tail. (recommended for pulling out the 95% credible interval)
+
+##LOS
+
+```{r}
+los_mod <- brm_multiple(los ~ treatment + surgery_type.factor,
+                        data=breast_split,family=poisson,
+                        iter=10000,seed=46137112,
+                        prior = c(prior(normal(0,10),class=b),
+                                  prior(student_t(3,0,100),class=Intercept)))
+los_convergence <- convergence(chains=4,imps=15,mod=los_mod)
+#los_summary <- summary(los_mod)
+#p(sup)
+los_ci <- bayestestR::hdi(los_mod)[2,3:4]
+#rate ratio
+losh <- hypothesis(los_mod,"treatment1 < 0")[["hypothesis"]] %>%
+  dplyr::select(Estimate,Post.Prob)
+losrr <- merge(los_ci,losh) %>%
+   mutate(RR = paste0(sprintf("%.2f",round(exp(Estimate),2))," (", round(exp(CI_low),2),", ",round(exp(CI_high),2),")"))
+
+#Mean difference
+# sims <- bind_rows(los_mod[["fit"]]@sim[["samples"]])
+# # Get all coefficients
+# intercept_samps <- sims[["b_Intercept"]]
+# beta_trt_samps <- sims[["b_treatment1"]]
+# beta_surgery_samps <- as.matrix(sims[grep("b_surgery_type", names(sims))])
+# 
+# # Create design matrices for the actual data
+# #control group
+# newdata0 <- breast_imp
+# newdata0$treatment <- factor(0, levels = levels(breast_imp$treatment))
+# #treatment group
+# newdata1 <- breast_imp
+# newdata1$treatment <- factor(1, levels = levels(breast_imp$treatment))
+# 
+# # Get model matrices
+# X0 <- model.matrix(~ treatment + surgery_type.factor, data = newdata0)
+# X1 <- model.matrix(~ treatment + surgery_type.factor, data = newdata1)
+# 
+# # Calculate predictions for each observation, then average
+# preds0 <- exp(X0 %*% t(cbind(intercept_samps, beta_trt_samps, beta_surgery_samps)))
+# preds1 <- exp(X1 %*% t(cbind(intercept_samps, beta_trt_samps, beta_surgery_samps)))
+# E_Y_given_X0 <- colMeans(preds0)  
+# E_Y_given_X1 <- colMeans(preds1)
+# 
+# md_trt <- E_Y_given_X1 - E_Y_given_X0
+# diffs <- data.frame(est=mean(md_trt),CI_low = hdi(md_trt)[1,2],CI_high = hdi(md_trt)[1,3],var = "Trt")
+# losmd <- merge(diffs,losh) %>%
+#   mutate(MD = paste0(sprintf("%.2f",round(est,2))," (", round(CI_low,2),", ",round(CI_high,2),")"))
+
+#crude and combine
+crude_los <- tbl_summary(data=breast,by="treatment",include="los",type=list(los = "continuous"),
+                         statistic=list(all_continuous() ~ "{median} ({N_nonmiss}, {p25}, {p75})"),
+                         digits = all_continuous() ~ 0,
+                         label = list(los ~ "los")) %>%
+  modify_header(stat_1 = "{level}",stat_2 = "{level}") %>%
+  as.data.frame()
+los_res <- merge(crude_los,losrr)
+
+saveRDS(los_res,here("Output","Br_los_res.RDS"))
+
+```
+
+
+### LOS PP only
+
+All control and per protocol participants in treatment
+```{r}
+breast_pp <- breast_imp %>% filter(treatment == "0" | per_protocol == 1)
+breast_pp_split <- split(breast_pp,f=breast_pp$.imp)
+
+los_mod <- brm_multiple(los ~ treatment + surgery_type.factor,
+                        data=breast_pp_split,family=poisson,
+                        iter=10000,seed=46137112,
+                        prior = c(prior(normal(0,10),class=b),
+                                  prior(student_t(3,0,100),class=Intercept)))
+
+#p(sup)
+los_ci <- bayestestR::hdi(los_mod)[2,3:4]
+#rate ratio
+losh <- hypothesis(los_mod,"treatment1 < 0")[["hypothesis"]] %>%
+  dplyr::select(Estimate,Post.Prob)
+losrr <- merge(los_ci,losh) %>%
+   mutate(RR = paste0(sprintf("%.2f",round(exp(Estimate),2))," (", round(exp(CI_low),2),", ",round(exp(CI_high),2),")"))
+#crude and combine
+crude_los <- breast %>% filter(treatment == "0" | per_protocol == 1) %>%
+tbl_summary(by="treatment",include="los",type=list(los = "continuous"),
+                         statistic=list(all_continuous() ~ "{median} ({N_nonmiss}, {p25}, {p75})"),
+                         digits = all_continuous() ~ 0,
+                         label = list(los ~ "lospp")) %>%
+  modify_header(stat_1 = "{level}",stat_2 = "{level}") %>%
+  as.data.frame()
+los_pp_res <- merge(crude_los,losrr)
+
+saveRDS(los_pp_res,here("Output","br_los_pp.RDS"))
+```
+
+
+##PCA device
+
+```{r}
+dev_mod <- brm_multiple(assess_pca ~ treatment + surgery_type.factor,data=breast_split,
+                        family=bernoulli,iter=25000,seed=46137112,
+                        prior = c(prior(normal(0,10),class="b"),
+                                  prior(student_t(3,0,100),class=Intercept)))
+dev_convergence <- convergence(chains=4,imps=15,mod=dev_mod)
+
+#model results
+dev_ci <- bayestestR::hdi(dev_mod)[2,3:4]
+devh <- hypothesis(dev_mod,"treatment1 > 0")[["hypothesis"]] %>%
+  dplyr::select(Estimate,Post.Prob)
+devor <- merge(dev_ci,devh) %>%
+  mutate(OR = paste0(sprintf("%.2f",round(exp(Estimate),2))," (", round(exp(CI_low),2),", ",round(exp(CI_high),2),")"))
+#crude and combine
+crude_dev <- tbl_summary(data=breast,by="treatment",include="assess_pca",missing="no",
+                           statistic = list(all_dichotomous() ~ "{n}/{N} ({p}%)")) %>%
+  modify_header(stat_1 = "{level}",stat_2 = "{level}") %>%
+  as.data.frame()
+dev_res <- merge(crude_dev,devor)
+saveRDS(dev_res,here("Output","Br_dev_res.RDS"))
+
+
+#SENSITIVITY OF PRIOR
+# dev_mod_sens <- brm_multiple(assess_pca ~ treatment + surgery_type.factor,data=breast_split,
+#                         family=bernoulli,iter=10000,
+#                         prior = c(prior(normal(0,100),class="b"),
+#                                   prior(student_t(3,0,100),class=Intercept)))
+#hdi = 0.005, exp(159), pr(sup) = 0.91, exp(53.71)
+```
+
+##Meals
+
+```{r}
+meal_mod <- brm_multiple(meals_bin ~ treatment + surgery_type.factor,data=breast_split,
+                        family=bernoulli,iter=15000,seed=46137112,
+                        prior = c(prior(normal(0,10),class="b"),
+                                  prior(student_t(3,0,100),class=Intercept)))
+meal_convergence <- convergence(chains=4,imps=15,mod=meal_mod)
+
+
+# Extract posterior samples
+# sims <- bind_rows(meal_mod[["fit"]]@sim[["samples"]])
+# intercept_samps <- sims[["b_Intercept"]]
+# beta_trt_samps <- sims[["b_treatment1"]]
+# 
+# # Get probabilities of outcome = 3 for each group (averaged over covariates)
+# # Using the same approach as before with model matrix
+# newdata0 <- breast_split[[1]]
+# newdata0$treatment <- 0
+# newdata1 <- breast_split[[1]]
+# newdata1$treatment <- 1
+# 
+# X0 <- model.matrix(~ treatment + surgery_type.factor, data = newdata0)
+# X1 <- model.matrix(~ treatment + surgery_type.factor, data = newdata1)
+# 
+# # Get all coefficient samples
+# beta_surgery_samps <- as.matrix(sims[grep("b_surgery_type", names(sims))])
+# all_coefs <- cbind(intercept_samps, beta_trt_samps, beta_surgery_samps)
+# 
+# # Probability of Y=3 for each group
+# prob_3_control <- plogis(X0 %*% t(all_coefs))
+# prob_3_treatment <- plogis(X1 %*% t(all_coefs))
+# 
+# # Average across observations
+# P_3_control <- colMeans(prob_3_control)
+# P_3_treatment <- colMeans(prob_3_treatment)
+# 
+# # Convert to mean difference
+# # E[Y] = 2*P(Y=2) + 3*P(Y=3) = 2*(1-P(Y=3)) + 3*P(Y=3) = 2 + P(Y=3)
+# E_Y_control <- 2 + P_3_control
+# E_Y_treatment <- 2 + P_3_treatment
+# 
+# md_trt <- E_Y_treatment - E_Y_control
+# diffs <- data.frame(est=mean(md_trt),CI_low = hdi(md_trt)[1,2],CI_high = hdi(md_trt)[1,3],var = "Trt")
+
+#model results
+#Odds ratio
+meal_ci <- bayestestR::hdi(meal_mod)[2,3:4]
+mealh <- hypothesis(meal_mod,"treatment1 > 0")[["hypothesis"]] %>%
+  dplyr::select(Estimate,Post.Prob)
+mealor <- merge(meal_ci,mealh) %>%
+  mutate(OR = paste0(sprintf("%.2f",round(exp(Estimate),2))," (", round(exp(CI_low),2),", ",round(exp(CI_high),2),")"))
+#crude and combine
+crude_meal <- tbl_summary(data=breast,by="treatment",include="meals_bin",missing="no",
+                          statistic = list(all_dichotomous() ~ "{n}/{N} ({p}%)")) %>%
+  modify_header(stat_1 = "{level}",stat_2 = "{level}") %>%
+  as.data.frame()
+meal_res <- merge(crude_meal,mealor)
+saveRDS(meal_res,here("Output","Br_meal_res.RDS"))
+
+#PRIOR SENSITIVITY
+# meal_mod_sens <- brm_multiple(meals_bin ~ treatment + surgery_type.factor,data=breast_split,
+#                         family=bernoulli,iter=10000,chains=4,
+#                         prior = c(prior(normal(0,100),class="b"),
+#                                   prior(student_t(3,0,100),class=Intercept)))
+
+```
+
+##Snacks
+
+```{r}
+breast_snacks <- breast_imp %>% 
+  mutate(snacks_hosp = factor(snacks_hosp,ordered=TRUE,
+                              levels=c("0","1","2","3")))
+breast_snacks <- split(x=breast_snacks,f=breast_snacks$.imp)
+
+snacks_mod <- brm_multiple(snacks_hosp ~ treatment + surgery_type.factor,data=breast_snacks,
+                        family=cumulative(link = "logit", threshold = "flexible"),
+                        iter=15000,seed=46137112,
+                        prior = c(prior(normal(0,10),class="b"),
+                                  prior(student_t(3,0,100),class=Intercept)))
+snacks_convergence <- convergence(chains=4,imps=15,mod=snacks_mod)
+# 
+# #getting a mean difference out of the ordinal model
+# sims <- bind_rows(snacks_mod[["fit"]]@sim[["samples"]])
+# intercepts_samps <- as.matrix(sims[grep("b_Intercept", names(sims))])
+# E_Y_given_X0 <- rowSums(plogis(intercepts_samps))
+# #treatment
+# beta_trt_samps <- sims[["b_treatment1"]]
+# # Compute expected probabilities for different treatment
+# E_Y_given_X1 <- rowSums(plogis(intercepts_samps + beta_trt_samps))
+# md_trt <- E_Y_given_X1 - E_Y_given_X0
+# diffs <- data.frame(est=mean(md_trt),CI_low = hdi(md_trt)[1,2],CI_high = hdi(md_trt)[1,3],var = "Trt")
+
+#model results
+snacks_ci <- bayestestR::hdi(snacks_mod)[2,3:4]
+snacksh <- hypothesis(snacks_mod,"treatment1 > 0")[["hypothesis"]] %>%
+  dplyr::select(Estimate,Post.Prob)
+snacksor <- merge(snacks_ci,snacksh) %>%
+  mutate(OR = paste0(sprintf("%.2f",round(exp(Estimate),2))," (", round(exp(CI_low),2),", ",round(exp(CI_high),2),")"))
+#crude and combine
+crude_snacks <- tbl_summary(data=breast,by="treatment",include="snacks_hosp",missing="no",
+                            statistic = list(all_categorical() ~ "{n}/{N} ({p}%)")) %>%
+  modify_header(stat_1 = "{level}",stat_2 = "{level}") %>%
+  as.data.frame()
+snacks_res <- merge(crude_snacks,snacksor)
+saveRDS(snacks_res,here("Output","Br_snacks_res.RDS"))
+
+```
+
+##Fluids
+
+```{r}
+fluids_mod <- brm_multiple(assess_liquid ~ treatment + surgery_type.factor,data=breast_split,
+                        family=gaussian,iter=10000,seed=46137112,
+                        prior = c(prior(normal(0,1000),class="b"),
+                                  prior(student_t(3,0,100),class=Intercept)))
+fluids_convergence <- convergence(chains=4,imps=15,mod=fluids_mod)
+
+#model results
+fluids_ci <- bayestestR::hdi(fluids_mod)[2,3:4]
+fluidsh <- hypothesis(fluids_mod,"treatment1 > 0")[["hypothesis"]] %>%
+  dplyr::select(Estimate,Post.Prob)
+fluidsmd <- merge(fluids_ci,fluidsh) %>%
+  mutate(MD = paste0(sprintf("%.2f",round(Estimate,2))," (", round(CI_low,2),", ",round(CI_high,2),")"))
+#crude and combine
+crude_fluids <- tbl_summary(data=breast,by="treatment",include="assess_liquid",missing="no",
+                            type = list(assess_liquid ~ "continuous"),
+                            statistic = list(all_continuous() ~ "{mean} ({N_nonmiss}, {sd})"),
+                            digits = all_continuous() ~ list(mean = 2, sd = 2, N_nonmiss = 0)
+                           ) %>%
+  modify_header(stat_1 = "{level}",stat_2 = "{level}") %>%
+  as.data.frame()
+fluids_res <- merge(crude_fluids,fluidsmd)
+saveRDS(fluids_res,here("Output","Br_fluids_res.RDS"))
+```
+
+##Time out of bed
+
+```{r}
+oob_mod <- brm_multiple(minutes_out_of_bed ~ treatment + surgery_type.factor,data=breast_split,
+                        family=gaussian,iter=10000,seed=46137112,
+                        prior = c(prior(normal(0,1000),class="b"),
+                                  prior(student_t(3,0,100),class=Intercept)))
+oob_convergence <- convergence(chains=4,imps=15,mod=oob_mod)
+#model results
+oob_ci <- bayestestR::hdi(oob_mod)[2,3:4]
+oobh <- hypothesis(oob_mod,"treatment1 > 0")[["hypothesis"]] %>%
+  dplyr::select(Estimate,Post.Prob)
+oobmd <- merge(oob_ci,oobh) %>%
+  mutate(MD = paste0(sprintf("%.2f",round(Estimate,2))," (", round(CI_low,2),", ",round(CI_high,2),")"))
+#crude and combine
+crude_oob <- tbl_summary(data=breast,by="treatment",include="minutes_out_of_bed",missing="no",
+                           statistic = list(all_continuous() ~ "{mean} ({N_nonmiss}, {sd})")) %>%
+  modify_header(stat_1 = "{level}",stat_2 = "{level}") %>%
+  as.data.frame()
+oob_res <- merge(crude_oob,oobmd)
+saveRDS(oob_res,here("Output","Br_oob_res.RDS"))
+
+```
+
+##Time spent moving
+
+```{r}
+move_mod <- brm_multiple(minutes_walking_moving ~ treatment + surgery_type.factor,data=breast_split,
+                        family=gaussian,iter=10000,seed=46137112,
+                        prior = c(prior(normal(0,1000),class="b"),
+                                  prior(student_t(3,0,100),class=Intercept)))
+move_convergence <- convergence(chains=4,imps=15,mod=move_mod)
+
+#model results
+move_ci <- bayestestR::hdi(move_mod)[2,3:4]
+moveh <- hypothesis(move_mod,"treatment1 > 0")[["hypothesis"]] %>%
+  dplyr::select(Estimate,Post.Prob)
+movemd <- merge(move_ci,moveh) %>%
+  mutate(MD = paste0(sprintf("%.2f",round(Estimate,2))," (", round(CI_low,2),", ",round(CI_high,2),")"))
+#crude and combine
+crude_move <- tbl_summary(data=breast,by="treatment",include="minutes_walking_moving",missing="no",
+                           statistic = list(all_continuous() ~ "{mean} ({N_nonmiss}, {sd})")) %>%
+  modify_header(stat_1 = "{level}",stat_2 = "{level}") %>%
+  as.data.frame()
+move_res <- merge(crude_move,movemd)
+saveRDS(move_res,here("Output","Br_move_res.RDS"))
+```
+
+##Times walked
+
+```{r}
+walk_mod <- brm_multiple(assess_walk_num ~ treatment + surgery_type.factor, 
+                         data=breast_split, family=poisson,seed=46137112,
+                             prior = c(prior(normal(0,10),class="b"),
+                                       prior(student_t(3,0,100),class=Intercept)),
+                             iter=10000)
+walk_convergence <- convergence(chains=4,imps=15,mod=walk_mod)
+# 
+# sims <- bind_rows(walk_mod[["fit"]]@sim[["samples"]])
+# 
+# # Get all coefficients
+# intercept_samps <- sims[["b_Intercept"]]
+# beta_trt_samps <- sims[["b_treatment1"]]
+# beta_surgery_samps <- as.matrix(sims[grep("b_surgery_type", names(sims))])
+# 
+# # Create design matrices for the actual data
+# #control group
+# newdata0 <- breast_imp
+# newdata0$treatment <- factor(0, levels = levels(breast_imp$treatment))
+# #treatment group
+# newdata1 <- breast_imp
+# newdata1$treatment <- factor(1, levels = levels(breast_imp$treatment))
+# 
+# # Get model matrices
+# X0 <- model.matrix(~ treatment + surgery_type.factor, data = newdata0)
+# X1 <- model.matrix(~ treatment + surgery_type.factor, data = newdata1)
+# 
+# # Calculate predictions for each observation, then average
+# preds0 <- exp(X0 %*% t(cbind(intercept_samps, beta_trt_samps, beta_surgery_samps)))
+# preds1 <- exp(X1 %*% t(cbind(intercept_samps, beta_trt_samps, beta_surgery_samps)))
+# E_Y_given_X0 <- colMeans(preds0)  
+# E_Y_given_X1 <- colMeans(preds1)
+# 
+# md_trt <- E_Y_given_X1 - E_Y_given_X0
+# diffs <- data.frame(est=mean(md_trt),CI_low = hdi(md_trt)[1,2],CI_high = hdi(md_trt)[1,3],var = "Trt")
+
+
+#model results
+walk_ci <- bayestestR::hdi(walk_mod)[2,3:4]
+walkh <- hypothesis(walk_mod,"treatment1 > 0")[["hypothesis"]] %>%
+  dplyr::select(Estimate,Post.Prob)
+walkrr <- merge(walk_ci,walkh) %>%
+  mutate(RR = paste0(sprintf("%.2f",round(exp(Estimate),2))," (", round(exp(CI_low),2),", ",round(exp(CI_high),2),")"))
+#crude and combine
+crude_walk <- tbl_summary(data=breast,by="treatment",include="assess_walk_num",missing="no",
+                           statistic = list(all_continuous() ~ "{median} ({N_nonmiss}, {p25}, {p75})")) %>%
+  modify_header(stat_1 = "{level}",stat_2 = "{level}") %>%
+  as.data.frame()
+walk_res <- merge(crude_walk,walkrr)
+saveRDS(walk_res,here("Output","Br_walk_res.RDS"))
+
+```
+
+##Times physio
+
+```{r}
+phys_mod <- brm_multiple(assess_exercises ~ treatment + surgery_type.factor,data=breast_split,
+                        family=poisson,iter=10000,seed=46137112,
+                        prior = c(prior(normal(0,10),class="b"),
+                                  prior(student_t(3,0,100),class=Intercept)))
+phys_convergence <- convergence(chains=4,imps=15,mod=phys_mod)
+
+# 
+# sims <- bind_rows(phys_mod[["fit"]]@sim[["samples"]])
+# 
+# # Get all coefficients
+# intercept_samps <- sims[["b_Intercept"]]
+# beta_trt_samps <- sims[["b_treatment1"]]
+# # Get surgery type coefficients too
+# beta_surgery_samps <- as.matrix(sims[grep("b_surgery_type", names(sims))])
+# 
+# # Create design matrices for the actual data
+# # For control group (treatment = 0)
+# newdata0 <- breast_imp
+# newdata0$treatment <- factor(0, levels = levels(breast_imp$treatment))
+# 
+# # For treatment group (treatment = 1)  
+# newdata1 <- breast_imp
+# newdata1$treatment <- factor(1, levels = levels(breast_imp$treatment))
+# 
+# # Get model matrices
+# X0 <- model.matrix(~ treatment + surgery_type.factor, data = newdata0)
+# X1 <- model.matrix(~ treatment + surgery_type.factor, data = newdata1)
+# 
+# # Calculate predictions for each observation, then average
+# preds0 <- exp(X0 %*% t(cbind(intercept_samps, beta_trt_samps, beta_surgery_samps)))
+# preds1 <- exp(X1 %*% t(cbind(intercept_samps, beta_trt_samps, beta_surgery_samps)))
+# 
+# E_Y_given_X0 <- colMeans(preds0)  # Average across observations
+# E_Y_given_X1 <- colMeans(preds1)
+# 
+# # Now check
+# mean(E_Y_given_X1) / mean(E_Y_given_X0)  # Should be ~0.95
+# md_trt <- E_Y_given_X1 - E_Y_given_X0
+# mean(md_trt)
+# diffs <- data.frame(est=mean(md_trt),CI_low = hdi(md_trt)[1,2],CI_high = hdi(md_trt)[1,3],var = "Trt")
+
+
+#model results
+phys_ci <- bayestestR::hdi(phys_mod)[2,3:4]
+physh <- hypothesis(phys_mod,"treatment1 > 0")[["hypothesis"]] %>%
+  dplyr::select(Estimate,Post.Prob)
+physrr <- merge(phys_ci,physh) %>%
+ mutate(RR = paste0(sprintf("%.2f",round(exp(Estimate),2))," (", round(exp(CI_low),2),", ",round(exp(CI_high),2),")"))
+#crude and combine
+crude_phys <- tbl_summary(data=breast,by="treatment",include="assess_exercises",missing="no",
+                          type=list(assess_exercises ~ "continuous"),
+                           statistic = list(all_continuous() ~ "{median} ({N_nonmiss}, {p25}, {p75})")) %>%
+  modify_header(stat_1 = "{level}",stat_2 = "{level}") %>%
+  as.data.frame()
+phys_res <- merge(crude_phys,physrr)
+saveRDS(phys_res,here("Output","Br_phys_res.RDS"))
+
+```
+
+##How to enhance own recovery
+
+```{r}
+# how_mod <- brm_multiple(how_bin ~ treatment + surgery_type.factor,data=breast_split,
+#                         family=bernoulli,iter=10000,
+#                         prior = c(prior(normal(0,5),class="b"),
+#                                   prior(student_t(3,0,100),class=Intercept)))
+# how_convergence <- convergence(chains=4,imps=15,mod=how_mod)
+
+#model results
+# how_ci <- bayestestR::hdi(how_mod)[2,3:4]
+# howh <- hypothesis(how_mod,"treatment1 > 0")[["hypothesis"]] %>%
+#   dplyr::select(Estimate,Post.Prob)
+# howor <- merge(how_ci,howh) %>%
+#   mutate(OR = paste0(sprintf("%.2f",round(exp(Estimate),2))," (", round(exp(CI_low),2),", ",round(exp(CI_high),2),")"))
+#crude and combine
+how_res <- breast %>%
+  mutate(how_bin = case_when(assess_understand_enhance.factor %in% c("A","SA") ~ 1,
+                             assess_understand_enhance.factor %in% c("N","D","SD") ~ 0)) %>%
+tbl_summary(by="treatment",include="how_bin",missing="no",
+                           statistic = list(all_categorical() ~ "{n}/{N} ({p}%)")) %>%
+  modify_header(stat_1 = "{level}",stat_2 = "{level}") %>%
+  as.data.frame() %>%
+  mutate(`**Characteristic**` = "how_bin") %>%
+  filter(!is.na(`1`))
+# how_res <- merge(crude_how)
+saveRDS(how_res,here("Output","Br_how_res.RDS"))
+
+```
+
+##QOR
+
+```{r}
+qor_mod <- brm_multiple(qor_tot ~ treatment + surgery_type.factor,data=breast_split,
+                        family=gaussian,iter=10000,seed=46137112,
+                        prior = c(prior(normal(0,1000),class="b"),
+                                  prior(student_t(3,0,100),class=Intercept)))
+qor_convergence <- convergence(chains=4,imps=15,mod=qor_mod)
+
+#model results
+qor_ci <- bayestestR::hdi(qor_mod)[2,3:4]
+qorh <- hypothesis(qor_mod,"treatment1 > 0")[["hypothesis"]] %>%
+  dplyr::select(Estimate,Post.Prob)
+qormd <- merge(qor_ci,qorh) %>%
+  mutate(MD = paste0(sprintf("%.2f",round(Estimate,2))," (", round(CI_low,2),", ",round(CI_high,2),")"))
+#crude and combine
+crude_qor <- tbl_summary(data=breast,by="treatment",include="qor_tot",missing="no",
+                         digits = all_continuous() ~ list(mean = 2, sd = 2, N_nonmiss = 0),
+                         statistic = list(all_continuous() ~ "{mean} ({N_nonmiss}, {sd})")) %>%
+  modify_header(stat_1 = "{level}",stat_2 = "{level}") %>%
+  as.data.frame()
+qor_res <- merge(crude_qor,qormd)
+saveRDS(qor_res,here("Output","Br_qor_res.RDS"))
+
+```
+
+##Combine
+
+```{r}
+#the results
+los_res <- readRDS(here("Output","Br_los_res.RDS"))
+dev_res <- readRDS(here("Output","Br_dev_res.RDS"))
+meal_res <- readRDS(here("Output","Br_meal_res.RDS"))
+snacks_res <- readRDS(here("Output","Br_snacks_res.RDS"))
+fluids_res <- readRDS(here("Output","Br_fluids_res.RDS"))
+oob_res <- readRDS(here("Output","Br_oob_res.RDS"))
+move_res <- readRDS(here("Output","Br_move_res.RDS"))
+walk_res <- readRDS(here("Output","Br_walk_res.RDS"))
+phys_res <- readRDS(here("Output","Br_phys_res.RDS"))
+how_res <- readRDS(here("Output","Br_how_res.RDS"))
+qor_res <- readRDS(here("Output","Br_qor_res.RDS"))
+los_pp_res <- readRDS(here("Output","br_los_pp.RDS"))
+
+res_models <- bind_rows(los_res,dev_res,meal_res,snacks_res,fluids_res,
+                        oob_res,move_res,walk_res,phys_res,how_res,qor_res,
+                        los_pp_res) %>%
+  filter(`**Characteristic**` != "Unknown") %>%
+  rename(char = `**Characteristic**`) %>%
+  mutate(est = case_when(!is.na(RR) ~ paste0("RR = ",RR),
+                         !is.na(OR) ~ paste0("OR = ",OR),
+                         !is.na(MD) ~ paste0("MD = ",MD)),
+         outcome = case_when(char == "los" ~ "Length of stay (median (N, IQR))",
+                             grepl("device",char) ~ "PCA device used (n/N %)",
+                             grepl("meals",char) ~ "3 Meals eaten (n/N %)",
+                             grepl("SNACKS",char) ~ "Snacks eaten (n/N %)",
+                             grepl("CUPS",char) ~ "Cups liquid consumed (mean (N, SD))",
+                             grepl("minutes out of bed",char) ~ "Time out of bed (mean (N, SD))",
+                             grepl("walking or moving",char) ~ "Time spent moving (mean (N, SD))",
+                             grepl("walk for at least",char) ~ "Times walked (median (N, IQR))",
+                             grepl("physio exercises",char) ~ "Times performed physio exercises (median (N, IQR))",
+                             char == "how_bin" ~ "Understand how to enhance own recovery (n/N %)",
+                             char == "qor_tot" ~ "QOR at 2 days (mean (N, SD))",
+                             char == "lospp" ~ "Length of stay - per protocol (median (N, IQR))")) %>%
+  dplyr::select(outcome,`1`,`0`,est,Post.Prob)
+
+saveRDS(res_models,here("Output","Br_res_models.RDS"))
+
+```
+
+# Analysis phase 2
+
+## Read in the data
+
+```{r}
+br_p2_imp <- readRDS(here("Data","br_p2_imp.RDS")) %>%
+   mutate(surgery_final = case_when(surgery_type.factor %in% c("Mastectomy and delayed reconstruction","Mastectomy - no reconstruction") ~ 1,
+                                   surgery_type.factor == "Mastectomy and immediate reconstruction" ~ 0))
+
+br_p2_split <- split(x=br_p2_imp,f=br_p2_imp$.imp)
+
+br_p2 <- readRDS(here("Data","br_p2.RDS"))
+```
+
+
+## EORTC QLQ-C30 (30 & 90 days)
+
+```{r}
+#Make baseline a separate variable
+eortc_base <- br_p2_imp %>%
+  filter(redcap_event_name.factor == "Baseline") %>%
+  dplyr::select(summary_score,record_id,.imp) %>%
+  rename(base_summary = summary_score)
+eortc <- br_p2_imp %>%
+  filter(redcap_event_name.factor != "Baseline") %>%
+  left_join(eortc_base, by=c("record_id",".imp"))
+eortc_split <- split(x=eortc,f=eortc$.imp)
+
+
+#run the model
+eortc_mod <- brm_multiple(summary_score ~ base_summary + surgery_type.factor +
+                           treatment*redcap_event_name.factor + (1|record_id),
+                           data=eortc_split,
+                           family=skew_normal,iter=16000,seed=46137112,
+                           control = list(adapt_delta = 0.995),
+                           prior = c(prior(normal(0,1000),class="b"),
+                                     prior(student_t(3,0,100),class=Intercept),
+                                     prior(cauchy(0,100),class=sigma)))
+
+#for sensitivity, do n(0,100) and n(0,10000)
+#assess risk of overfitting
+loo_res <- loo(eortc_mod)
+#loo_res_dich <- loo(eortc_mod_dich)
+
+#n(0,100) neglibigle difference, same with n(0,10000)
+summary(eortc_mod)
+eortc_convergence <- convergence(chains=4,imps=15,mod=eortc_mod) %>% bind_rows()
+
+#get the CrI and Pr(Sup) from the models
+eortch <- hypothesis(eortc_mod,c("treatment1 > 0",
+                                 "treatment1 + treatment1:redcap_event_name.factor3monthfup > 0"),
+                     alpha=0.025)[["hypothesis"]] %>%
+  dplyr::select(Hypothesis,Estimate,Post.Prob,CI.Lower,CI.Upper) %>%
+  mutate(redcap_event_name.factor = case_when(grepl("3month",Hypothesis) ~ "3 month fup",
+                          .default="1 month fup"),
+         MD = paste0(sprintf("%.2f",round(Estimate,2))," (", round(CI.Lower,2),", ",round(CI.Upper,2),")"))
+
+#get the crude measures and combine
+eortc_res <- br_p2 %>% 
+  group_by(redcap_event_name.factor,treatment) %>% 
+  summarise(summary_score = paste0(round(mean(summary_score,na.rm=T),2)," (",sum(!is.na(summary_score)),", ",round(sd(summary_score,na.rm=T),2),")")) %>% 
+  pivot_wider(id_cols=redcap_event_name.factor,names_from=treatment,values_from=summary_score) %>%
+  filter(redcap_event_name.factor != "Admission") %>%
+  full_join(eortch,by="redcap_event_name.factor")
+
+saveRDS(eortc_res,here("Output","br_p2_eortc.RDS"))
+```
+
+
+## HADS (Anxiety)  (30 & 90 days)
+
+```{r}
+#Make baseline a separate variable
+hads_base <- br_p2_imp %>%
+  filter(redcap_event_name.factor == "Baseline") %>%
+  dplyr::select(hads_anxiety,record_id,.imp) %>%
+  rename(base_hads = hads_anxiety)
+hads <- br_p2_imp %>%
+  filter(redcap_event_name.factor != "Baseline") %>%
+  left_join(hads_base, by=c("record_id",".imp"))
+hads_split <- split(x=hads,f=hads$.imp)
+
+#run the model
+hads_mod <- brm_multiple(hads_anxiety ~ surgery_type.factor + base_hads + treatment*redcap_event_name.factor + (1|record_id),
+                         data=hads_split,
+                         family=gaussian,iter=14000,seed=46137112,
+                         control = list(adapt_delta = 0.99),
+                         prior = c(prior(normal(0,1000),class="b"),
+                                   prior(student_t(3,0,100),class=Intercept),
+                                   prior(cauchy(0,100),class=sigma)))
+
+#sensitivity n(0,100) negligible difference, same with n(0,10000)
+hads_convergence <- convergence(chains=4,imps=15,mod=hads_mod) %>% bind_rows()
+summary(hads_mod)
+
+#get the CrI and Pr(Sup) from the models
+hadsh <- hypothesis(hads_mod,c("treatment1 < 0",
+                                 "treatment1 + treatment1:redcap_event_name.factor3monthfup < 0"),
+                    alpha=0.025)[["hypothesis"]] %>%
+  dplyr::select(Hypothesis,Estimate,Post.Prob,CI.Lower,CI.Upper) %>%
+  mutate(redcap_event_name.factor = case_when(grepl("3month",Hypothesis) ~ "3 month fup",
+                          .default="1 month fup"),
+         MD = paste0(sprintf("%.2f",round(Estimate,2))," (", round(CI.Lower,2),", ",round(CI.Upper,2),")"))
+
+#get the crude measures and combine
+hads_res <- br_p2 %>% 
+  group_by(redcap_event_name.factor,treatment) %>% 
+  summarise(hads_anxiety = paste0(round(mean(hads_anxiety,na.rm=T),2)," (",sum(!is.na(hads_anxiety)),", ",round(sd(hads_anxiety,na.rm=T),2),")")) %>% 
+  pivot_wider(id_cols=redcap_event_name.factor,names_from=treatment,values_from=hads_anxiety) %>%
+  filter(redcap_event_name.factor != "Admission") %>%
+  full_join(hadsh,by="redcap_event_name.factor")
+
+saveRDS(hads_res,here("Output","br_p2_hads.RDS"))
+
+```
+
+
+## QOR (2, 30 & 90 days)
+
+```{r}
+#run the model
+qor_mod <- brm_multiple(qor_tot ~ surgery_type.factor + redcap_event_name.factor*treatment + (1|record_id),data=br_p2_split,
+                        family=gaussian,iter=14000,seed=46137112,
+                        prior = c(prior(normal(0,1000),class="b"),
+                                  prior(student_t(3,0,100),class=Intercept),
+                                  prior(cauchy(0,100),class=sigma)))
+
+#sensitivity of n(0,100) slightly closer to 0 est and slightly smaller CrI, opposite for n(0,10000)
+qor_convergence <- convergence(chains=4,imps=15,mod=qor_mod) %>% bind_rows()
+test <- loo(qor_mod)
+summary(qor_mod)
+
+#get the CrI and Pr(Sup) from the models
+qorh <- hypothesis(qor_mod,c("treatment1 > 0",
+                                 "treatment1 + redcap_event_name.factor3monthfup:treatment1 > 0",
+                                 "treatment1 + redcap_event_name.factorAdmission:treatment1 > 0"),
+                   alpha=0.025)[["hypothesis"]] %>%
+  dplyr::select(Hypothesis,Estimate,Post.Prob,CI.Lower,CI.Upper) %>%
+  mutate(redcap_event_name.factor = case_when(grepl("3month",Hypothesis) ~ "3 month fup",
+                                              grepl("Admission",Hypothesis) ~ "Admission",
+                          .default="1 month fup"),
+         MD = paste0(sprintf("%.2f",round(Estimate,2))," (", round(CI.Lower,2),", ",round(CI.Upper,2),")"))
+
+#get the crude measures and combine
+qor_res <- br_p2 %>% 
+  group_by(redcap_event_name.factor,treatment) %>% 
+  summarise(qor_tot = paste0(round(mean(qor_tot,na.rm=T),2)," (",sum(!is.na(qor_tot)),", ",round(sd(qor_tot,na.rm=T),2),")")) %>% 
+  pivot_wider(id_cols=redcap_event_name.factor,names_from=treatment,values_from=qor_tot) %>%
+  filter(redcap_event_name.factor != "Baseline") %>%
+  merge(qorh,by="redcap_event_name.factor")
+
+saveRDS(qor_res,here("Output","br_p2_qor.RDS"))
+
+```
+
+
+## Health service utilisation (90 days)
+
+```{r}
+
+cost_imp <- br_p2_imp %>% mutate(cost = round(services_total_cost,0))
+cost_split <- split(x=cost_imp,f=cost_imp$.imp)
+
+cost <- brm_multiple(services_total_cost ~ treatment + surgery_final,
+    data=br_p2_split,
+    family = skew_normal,iter=14000,seed=46137112,
+    control = list(adapt_delta = 0.99),
+    prior = c(prior(normal(0,1000)),
+              prior(student_t(3,0,100),class=Intercept)))
+
+costh <- hypothesis(cost,c("treatment1 < 0"),
+                   alpha=0.025)[["hypothesis"]] %>%
+  dplyr::select(Hypothesis,Estimate,Post.Prob,CI.Lower,CI.Upper) %>%
+  mutate(MD = paste0(sprintf("%.2f",round(Estimate,2))," (", round(CI.Lower,2),", ",round(CI.Upper,2),")"))
+#get the crude measures and combine
+cost_res <- br_p2 %>% 
+  group_by(treatment,redcap_event_name.factor) %>% 
+  summarise(services_total_cost = paste0(round(mean(services_total_cost,na.rm=T),2)," (",sum(!is.na(services_total_cost)),
+                                         ", ",round(sd(services_total_cost,na.rm=T),2),")")) %>% 
+  pivot_wider(id_cols=redcap_event_name.factor,names_from=treatment,values_from=services_total_cost) %>%
+  filter(redcap_event_name.factor == "3 month fup") %>%
+  merge(costh)
+
+saveRDS(cost_res,here("Output","br_p2_cost.RDS"))
+
+```
+
+## ED presentations
+
+```{r}
+
+ed_mod <- brm(ed_presentations_3mo ~ surgery_type.factor + treatment,data=br_p2,
+              family=bernoulli,iter=12000,seed=46137112,
+              prior = c(prior(normal(0,10),class="b"),
+                        prior(student_t(3,0,100),class=Intercept)))
+
+#sensitivity n(0,1) difference towards the null, less change in n(0,100) away from null
+summary(ed_mod)
+
+ed_ci <- bayestestR::hdi(ed_mod)[3,3:4]
+edh <- hypothesis(ed_mod,"treatment1 < 0")[["hypothesis"]] %>%
+  dplyr::select(Estimate,Post.Prob)
+edor <- merge(ed_ci,edh) %>%
+  mutate(OR = paste0(sprintf("%.2f",round(exp(Estimate),2))," (", round(exp(CI_low),2),", ",round(exp(CI_high),2),")"))
+
+ed_res <- br_p2 %>%
+  group_by(treatment) %>%
+  filter(redcap_event_name.factor == "3 month fup") %>%
+  summarise(ed_presentations_3mo = paste0(sum(ed_presentations_3mo)," / ",n()," (",round(sum(ed_presentations_3mo)/n()*100,2),"%)")) %>%
+  pivot_wider(names_from=treatment,values_from=ed_presentations_3mo) %>%
+  merge(edor)
+
+saveRDS(ed_res,here("Output","ed_res.RDS"))
+```
+
+## Readmissions
+
+```{r}
+read_mod <- brm(admissions_3mo ~ surgery_type.factor + treatment,data=br_p2,
+              family=bernoulli,iter=12000,seed=46137112,
+              prior = c(prior(normal(0,10),class="b"),
+                        prior(student_t(3,0,100),class=Intercept)))
+#sensitivity n(0,1) towards null, much smaller CrI. n(0,100) almost identical
+summary(read_mod)
+read_ci <- bayestestR::hdi(read_mod)[3,3:4]
+readh <- hypothesis(read_mod,"treatment1 < 0")[["hypothesis"]] %>%
+  dplyr::select(Estimate,Post.Prob)
+reador <- merge(read_ci,readh) %>%
+  mutate(OR = paste0(sprintf("%.2f",round(exp(Estimate),2))," (", round(exp(CI_low),2),", ",round(exp(CI_high),2),")"))
+
+read_res <- br_p2 %>%
+  group_by(treatment) %>%
+  filter(redcap_event_name.factor == "3 month fup") %>%
+  summarise(admissions_3mo = paste0(sum(admissions_3mo)," / ",n()," (",round(sum(admissions_3mo)/n()*100,2),"%)")) %>%
+  pivot_wider(names_from=treatment,values_from=admissions_3mo) %>%
+  merge(reador)
+
+saveRDS(read_res,here("Output","read_res.RDS"))
+```
+
+## Combine
+
+```{r}
+eortc_res <- readRDS(here("Output","br_p2_eortc.RDS")) %>% mutate(outcome = "EORTC (mean (N, SD))",v=1)
+hads_res <- readRDS(here("Output","br_p2_hads.RDS")) %>% mutate(outcome = "HADS anxiety (mean (N, SD))",v=2)
+qor_res <- readRDS(here("Output","br_p2_qor.RDS")) %>% mutate(outcome = "QOR (mean (N, SD))",v=3)
+cost_res <- readRDS(here("Output","br_p2_cost.RDS")) %>% mutate(outcome = "Health service utilisation (mean (N, SD))",v=4)
+ed_res <- readRDS(here("Output","ed_res.RDS")) %>% mutate(outcome = "ED presentation (n / N (%))",v=5)
+read_res <- readRDS(here("Output","read_res.RDS")) %>% mutate(outcome = "Readmission (n / N (%))",v=6)
+
+
+p2_res <- bind_rows(eortc_res,hads_res,qor_res,cost_res,ed_res,read_res) %>%
+  mutate(time = factor(case_when(redcap_event_name.factor == "Baseline" ~ "Baseline",
+                          redcap_event_name.factor == "Admission" ~ "2 days",
+                          redcap_event_name.factor == "1 month fup" ~ "30 days",
+                          redcap_event_name.factor == "3 month fup" ~ "90 days",
+                          .default="90 days"),
+                       levels=c("Baseline","2 days","30 days","90 days")),
+         est = case_when(!is.na(MD) ~ paste0("MD = ",MD),
+                         !is.na(OR) ~ paste0("OR = ",OR))) %>%
+  rename(treatment = `1`,
+         control = `0`) %>%
+  ungroup() %>%
+  arrange(v,time) %>%
+  dplyr::select(outcome,time,treatment,control,est,Post.Prob)
+
+saveRDS(p2_res,here("Output","Br_p2_res.RDS"))
+```
+
